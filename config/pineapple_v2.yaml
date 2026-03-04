@@ -1,0 +1,40 @@
+# configuration for mujoco_rl_him
+policy_path: "/home/csl/pineapple/pineapple_rl_deploy/model/2026-03-02_23-41-17.pt"
+xml_path: "/home/csl/pineapple/pineapple_rl_deploy/robot/pineapple_v2/scene.xml"
+
+# Total simulation time
+simulation_duration: 60.0
+# Simulation time step
+simulation_dt: 0.005
+# Controller update frequency (meets the requirement of simulation_dt * controll_decimation=0.02; 50Hz)
+control_decimation: 4
+
+# KP, KD gains for the PD controller, order matches xml joint order
+kps: [40, 40, 40, 0, 40, 40, 40,  0]
+kds: [1.0, 1.0, 1.0, 0.3, 1.0, 1.0, 1.0, 0.3]
+
+
+# default_angles, order matches xml joint order
+# default_angles: [0.0,  0.879, -1.469, 0.0, 0.0, 0.879, -1.469, 0.0]
+default_angles: [0.0,  0.83, -1.484, 0.0, 0.0, 0.83, -1.484, 0.0] 
+sit_angles: [0.093, 1.49, -3.14, 0, 0.093, 1.49, -3.14, 0]
+
+lin_vel_scale: 2.0
+ang_vel_scale: 0.25
+
+dof_pos_scale: 1.0
+dof_vel_scale: 0.05
+pos_action_scale: 0.5  # 0.5
+vel_action_scale: 5.0
+cmd_scale: [1.0, 1.0, 1.0]
+num_actions: 8
+num_obs: 186
+one_step_obs_size: 31
+obs_buffer_size: 6
+leg_joint_indices: [0, 1, 2, 3, 4, 5]   # leg joints indices from policy
+wheel_joint_indices: [6, 7]   # wheel joints indices from policy
+policy_index_map: [0, 4, 1, 5, 2, 6, 3, 7] # Mapping from policy index to xml index. Change this if policy order differs from XML order.
+
+cmd_init: [0.0, 0.0, 0.0]
+max_lin_vel: 1.0
+max_ang_vel: 2.0
