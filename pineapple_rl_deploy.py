@@ -8,7 +8,8 @@ import csv
 import argparse
 import matplotlib.pyplot as plt # Import for plotting
 import torch
-import gui_teleop 
+# import gui_teleop_v2_1 as gui_teleop
+from headless_teleop import HeadlessTeleop
 
 from unitree_sdk2py.core.channel import ChannelPublisher, ChannelFactoryInitialize
 from unitree_sdk2py.core.channel import ChannelSubscriber, ChannelFactoryInitialize
@@ -19,6 +20,30 @@ from unitree_sdk2py.utils.crc import CRC
 from unitree_sdk2py.utils.thread import RecurrentThread
 
 NUM_MOTORS = 8
+
+def apply_diamond_constraint(cmd, max_lin, max_ang):
+    """
+    Applies a diamond-shaped constraint (L1 norm) on linear and angular commands:
+    |v_x| / v_max + |w_z| / w_max <= 1
+    """
+    vx = cmd[0]
+    wz = cmd[2]
+
+    limit_vx = max_lin
+    limit_wz = max_ang
+
+    if limit_vx < 1e-6:
+        limit_vx = 1.0
+    if limit_wz < 1e-6:
+        limit_wz = 1.0
+
+    ratio = abs(vx) / limit_vx + abs(wz) / limit_wz
+    if ratio > 1.0:
+        scaling = 1.0 / ratio
+        cmd[0] *= scaling
+        cmd[2] *= scaling
+
+    return cmd
 
 class Filter:
     def __init__(self, alpha):
@@ -60,6 +85,10 @@ class Controller:
             self.vel_action_scale = config["vel_action_scale"]
             self.cmd_scale = np.array(config["cmd_scale"], dtype=np.float32)
 
+            # Optional low-pass filtering for IMU angular velocity.
+            self.use_ang_vel_filter = config.get("use_ang_vel_filter", False)
+            self.ang_vel_filter_alpha = float(config.get("ang_vel_filter_alpha", 0.95))
+
             num_actions = config["num_actions"]
             num_obs = config["num_obs"]
             one_step_obs_size = config["one_step_obs_size"]
@@ -71,12 +100,46 @@ class Controller:
 
             max_lin = config.get("max_lin_vel", 1.0)
             max_ang = config.get("max_ang_vel", 1.0)
+            self.max_lin = max_lin
+            self.max_ang = max_ang
+
+            # Optional base-height command (enabled for height-conditioned policies).
+            self.use_height_command = config.get("use_height_command", False)
+            self.height_scale = config.get("height_scale", 1.0)
+            self.cmd_height_init = config.get("cmd_height_init", 0.3)
+            self.min_height = config.get("min_height", 0.2)
+            self.max_height = config.get("max_height", 0.35)
+            self.height_step = config.get("height_step", 0.005)
 
             self.policy_index_map = config.get("policy_index_map", None)
             if self.policy_index_map is not None:
                 self.policy_index_map = np.array(self.policy_index_map, dtype=np.int64)
-        
-        self.teleop = gui_teleop.GUITeleop(config_init=config["cmd_init"], max_lin=max_lin, max_ang=max_ang)
+
+        if self.use_height_command:
+            # pass
+            # self.teleop = gui_teleop.GUITeleop(
+            #     config_init=config["cmd_init"],
+            #     max_lin=max_lin,
+            #     max_ang=max_ang,
+            #     height_init=self.cmd_height_init,
+            #     height_step=self.height_step,
+            #     min_height=self.min_height,
+            #     max_height=self.max_height,
+            # )
+            self.teleop = HeadlessTeleop(
+                config_init=config["cmd_init"], 
+                max_lin=max_lin, 
+                max_ang=max_ang,
+                height_init=self.cmd_height_init,
+                height_step=self.height_step,
+                min_height=self.min_height,
+                max_height=self.max_height
+            )
+            print("Headless teleop initialized (no GUI window).")
+        else:
+            # pass
+            # self.teleop = gui_teleop.GUITeleop(config_init=config["cmd_init"], max_lin=max_lin, max_ang=max_ang)
+            self.teleop = HeadlessTeleop(config_init=config["cmd_init"], max_lin=max_lin, max_ang=max_ang)
         self.target_dof_pos = self.default_angles.copy()
         self.target_dof_vel = np.zeros(num_actions)
         self.action = np.zeros(num_actions, dtype=np.float32)
@@ -112,7 +175,9 @@ class Controller:
         self.qvel = np.zeros(NUM_MOTORS, dtype=np.float32)
         self.qtau = np.zeros(NUM_MOTORS, dtype=np.float32)
         self.quat = np.zeros(4) # q_w q_x q_y q_z
+        self.ang_vel_raw = np.zeros(3)
         self.ang_vel = np.zeros(3)
+        self.ang_vel_filters = [Filter(self.ang_vel_filter_alpha) for _ in range(3)]
 
         self.mode = ''
         # self.dt = 0.001
@@ -123,6 +188,12 @@ class Controller:
 
         self.first_logged = False
         self.second_logged = False
+
+        # Runtime frequency logging for move mode.
+        self.move_freq_log_interval = 1.0  # seconds
+        self.move_loop_count = 0
+        self.move_policy_update_count = 0
+        self.move_freq_window_start = time.perf_counter()
 
     # Control methods
     def Init(self):
@@ -212,6 +283,25 @@ class Controller:
     def reset_timer(self):
         self.controller_rt = 0.0
         self.counter = 0
+        self.move_loop_count = 0
+        self.move_policy_update_count = 0
+        self.move_freq_window_start = time.perf_counter()
+
+    def _log_move_frequency(self, policy_updated=False):
+        self.move_loop_count += 1
+        if policy_updated:
+            self.move_policy_update_count += 1
+
+        now = time.perf_counter()
+        elapsed = now - self.move_freq_window_start
+        if elapsed >= self.move_freq_log_interval:
+            loop_hz = self.move_loop_count / elapsed
+            policy_hz = self.move_policy_update_count / elapsed
+            print(f"[move freq] loop: {loop_hz:.2f} Hz | policy: {policy_hz:.2f} Hz")
+
+            self.move_loop_count = 0
+            self.move_policy_update_count = 0
+            self.move_freq_window_start = now
     
     def sit(self):
         self.controller_rt += self.dt
@@ -229,6 +319,7 @@ class Controller:
                 self.low_cmd.motor_cmd[i].tau = 0.0
     
     def move(self):
+        policy_updated = False
         if self.counter % self.control_decimation == 0 and self.counter > 0:
 
             if self.policy_index_map is not None:
@@ -241,6 +332,11 @@ class Controller:
                 default_angles_pol = self.default_angles
 
             current_cmd_vel = np.array(self.teleop.get_command(), dtype=np.float32)
+            current_cmd_vel = apply_diamond_constraint(current_cmd_vel, self.max_lin, self.max_ang)
+            # current_cmd_vel = np.array([0.0, 0.0, 0.0], dtype=np.float32)
+            if self.use_height_command:
+                current_cmd_height = np.array([self.teleop.get_height_command()], dtype=np.float32)
+                # current_cmd_height = np.array([0.3], dtype=np.float32)
 
             gravity_b = self.get_gravity_orientation(self.quat)
 
@@ -253,10 +349,14 @@ class Controller:
                 self.ang_vel.copy() * self.ang_vel_scale,
                 gravity_b,
                 current_cmd_vel * self.cmd_scale,
+            ]
+            if self.use_height_command:
+                obs_list.append(current_cmd_height * self.height_scale)
+            obs_list.extend([
                 leg_pos_delta,
                 qvel_obs * self.dof_vel_scale,
-                self.action.astype(np.float32).copy()
-            ]
+                self.action.astype(np.float32).copy(),
+            ])
 
             obs_list = [torch.tensor(obs, dtype=torch.float32) if isinstance(obs, np.ndarray) else obs for obs in obs_list]
 
@@ -275,6 +375,7 @@ class Controller:
 
             # obs inference
             self.action = self.policy(obs_tensor_buf).detach().numpy().squeeze()
+            policy_updated = True
 
             # Set leg joint target positions
             for idx in self.leg_joint_indices:       # 0 1 2 3 4 5
@@ -302,12 +403,13 @@ class Controller:
                 self.low_cmd.motor_cmd[i].kd = self.kds[i]
                 self.low_cmd.motor_cmd[i].tau = 0.0
 
-            if not self.first_logged:
-                print("First action command sent: ", time.time())
-                self.first_logged = True
-            if self.first_logged and not self.second_logged and self.qvel[3]>1.0:
-                print("Second action command sent (robot starts moving): ", time.time())
-                self.second_logged = True
+            # if not self.first_logged:
+            #     print("First action command sent: ", time.time())
+            #     self.first_logged = True
+            # if self.first_logged and not self.second_logged and self.qvel[3]>1.0:
+            #     print("Second action command sent (robot starts moving): ", time.time())
+            #     self.second_logged = True
+        # self._log_move_frequency(policy_updated=policy_updated)
         self.counter += 1
     
 
@@ -331,7 +433,12 @@ class Controller:
             self.qtau[i] = self.low_state.motor_state[i].tau_est
 
         for i in range(3):
-            self.ang_vel[i] = self.low_state.imu_state.gyroscope[i]
+            gyro_i = self.low_state.imu_state.gyroscope[i]
+            self.ang_vel_raw[i] = gyro_i
+            if self.use_ang_vel_filter:
+                self.ang_vel[i] = self.ang_vel_filters[i].filt(gyro_i)
+            else:
+                self.ang_vel[i] = gyro_i
         
         # print("angular vel: ", self.ang_vel)
 
@@ -391,7 +498,7 @@ if __name__ == '__main__':
     #     ChannelFactoryInitialize(1, sys.argv[1])
     # else:
     #     ChannelFactoryInitialize(1, "lo") # default DDS port for pineapple
-    ChannelFactoryInitialize(1, "enx7cc2c65314b0")
+    ChannelFactoryInitialize(1, "eth0")
     # ChannelFactoryInitialize(1, "lo")
     controller = Controller()
     controller.Init()
